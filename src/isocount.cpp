@@ -61,10 +61,11 @@ struct Config {
     std::string anno_path; /** The path to the BED6 annotation. */
     std::string alig_path; /** The path to the SAM alignment. */
 
-    std::string defcut_spec; /** The cutoff description. */
-    std::vector<std::string> cgrp_specs; /** Cutoff-group specifications. */
+    std::string defcut_spec; /** Default cutoff spec. */
+    std::vector<std::string> cgrp_specs; /** Cutoff group specs. */
+    std::string dist_dir; /** Directory to put distribution info in. */
 
-    std::string dist_dir; /** Whether to print the distribution. */
+    bool antisense; /** Serialize isoforms in antisense order. */
 };
 
 /** A convenience class representing a percent value. */
@@ -176,13 +177,19 @@ public:
     /** Get the score attached to each feature for this alignment.
      *
      * Score formula:
-     * (matches - mismatches - deletions - insertions) / feature_length */
+     * 100 * (matches / (matches + mistakes)) */
     std::unordered_map<std::string, double> get_scores() const;
 
+    /** Use the given cutoff table to serialize (name) this isoform. */
+    std::string serialize(CutoffTable const& cuts, bool reverse) const;
+
 protected:
-    std::unordered_map<std::string, uint32_t> lengths;
-    std::unordered_map<std::string, uint32_t> matches;
-    std::unordered_map<std::string, uint32_t> mistakes;
+    struct FeatureInfo {
+        FeatureInfo();
+        uint32_t mat, mis, ins, del;
+    };
+    std::unordered_map<std::string, FeatureInfo> feat_info;
+    Annotation const& anno;
 };
 
 /* IMPLEMENTATIONS */
@@ -257,11 +264,16 @@ Config::Config(int argc, char **argv) {
                 ("Output the distribution of mistake ratios for each feature "
                  "the given directory."),
                 false, "", "dists/");
+        SwitchArg antisense_arg(
+                "r", "antisense",
+                "Sort features in antisense order when serializing isoforms.");
+
         cmd.add(anno_arg);
         cmd.add(alig_arg);
         cmd.add(defcut_arg);
         cmd.add(cutgroups_arg);
         cmd.add(distdir_arg);
+        cmd.add(antisense_arg);
         cmd.parse(argc, argv);
 
         anno_path = anno_arg.getValue();
@@ -269,6 +281,7 @@ Config::Config(int argc, char **argv) {
         defcut_spec = defcut_arg.getValue();
         cgrp_specs = cutgroups_arg.getValue();
         dist_dir = distdir_arg.getValue();
+        antisense = antisense_arg.getValue();
 
         if (dist_dir.empty() == defcut_spec.empty()) {
             // both or neither is specified
@@ -527,11 +540,14 @@ CutoffTable::CutoffTable(Annotation const& anno, std::string const& defspec,
     }
 }
 
-Isoform::Isoform(Annotation const& anno, SAMRecord const& rec) {
+Isoform::FeatureInfo::FeatureInfo() {
+    mat = mis = ins = del = 0;
+}
+Isoform::Isoform(Annotation const& annot, SAMRecord const& rec)
+    : anno(annot) {
+
     for (Feature const& f : anno) {
-        matches[f.name] = 0;
-        mistakes[f.name] = 0;
-        lengths[f.name] = f.end-f.start;
+        feat_info.emplace(f.name, FeatureInfo());
     }
 
     uint32_t refpos = rec.start; // the current position in the reference
@@ -562,16 +578,15 @@ Isoform::Isoform(Annotation const& anno, SAMRecord const& rec) {
     // a deque is more useful to us here (we may need to push ops back in)
     std::deque<SAMRecord::CigarOp> cigar(rec.cigar.begin(), rec.cigar.end());
 
+    // handle each feature
     while (!cigar.empty() && f_idx < int(anno.size())) {
         uint32_t end = feat_bounds.front();
         feat_bounds.pop();
 
-        uint32_t *match_count = nullptr;
-        uint32_t *mistake_count = nullptr;
+        // the currently-relevant info struct
+        FeatureInfo *info = nullptr;
         if (f_idx != -1) {
-            std::string const& fname = anno[f_idx].name;
-            match_count = &(matches[fname]);
-            mistake_count = &(mistakes[fname]);
+            info = &(feat_info[anno[f_idx].name]);
         }
 
         // consume ops until we get to the end of this feature
@@ -582,30 +597,43 @@ Isoform::Isoform(Annotation const& anno, SAMRecord const& rec) {
             uint32_t count = op.first;
             char ch = op.second;
             uint32_t consumed = 0; // consumed from SEQ (not ref)
+            uint32_t delta = 0; // moved in ref
 
             // the relevant tally (matches or mismatches)
             uint32_t *tally = nullptr;
 
-            if (ch == 'I') {
-                // ins; not ref-consuming
-                consumed = count;
-                tally = mistake_count;
-            }
-            else if (ch == 'D' || ch == 'X' || ch == 'N') {
-                // del or mis; ref-consuming
-                consumed = std::min(end-refpos, count);
-                tally = mistake_count;
-                refpos += consumed;
-            }
-            else if (ch == '=') {
+            consumed = std::min(end-refpos, count); // ONLY FOR REF-CONS OPS
+            delta = consumed; // ONLY TRUE FOR REF-CONSUMING OPERATIONS!
+            if (ch == '=') {
                 // match; ref-consuming
-                consumed = std::min(end-refpos, count);
-                tally = match_count;
-                refpos += consumed;
+                if (info) {
+                    tally = &(info->mat);
+                }
+            }
+            else if (ch == 'X') {
+                // mismatch; ref-consuming
+                if (info) {
+                    tally = &(info->mis);
+                }
+            }
+            else if (ch == 'I') {
+                // insertion; NOT ref-consuming!!
+                consumed = count;
+                delta = 0;
+                if (info) {
+                    tally = &(info->ins);
+                }
+            }
+            else if (ch == 'D' || ch == 'N') {
+                // deletion; ref-consuming
+                if (info) {
+                    tally = &(info->del);
+                }
             }
             else {
                 // we don't care about anything else; just skip and move on
                 consumed = count;
+                delta = 0;
             }
 
             // add to the relevant tally (if f_idx != -1)
@@ -618,67 +646,165 @@ Isoform::Isoform(Annotation const& anno, SAMRecord const& rec) {
             if (consumed != count) {
                 cigar.emplace_front(count-consumed, ch);
             }
+
+            refpos += delta;
         }
 
+        if (cigar.empty() && info) {
+            // the read ended, possibly in the middle of a feature
+            // ==> count the uncovered part of the feature as a deletion
+            info->del += end-refpos;
+        }
         f_idx++;
     }
 }
 std::unordered_map<std::string, double> Isoform::get_scores() const {
     std::unordered_map<std::string, double> ret;
-    for (auto const& p : lengths) {
+    for (auto const& p : feat_info) {
         std::string const& fname = p.first;
+        FeatureInfo const& info = feat_info.at(fname);
 
-        double f_len = p.second;
-        double n_good = int(matches.at(fname));
-        double n_bad = int(mistakes.at(fname));
-        ret[fname] = (n_good-n_bad)/f_len;
+        double n_good = info.mat;
+        double n_bad = info.mis + info.ins + info.del;
+        double denom = n_good+n_bad;
+
+        if (denom < 0.9) { // denom == 0
+            ret[fname] = 0;
+        }
+        else {
+            ret[fname] = 100.0*(n_good/denom);
+        }
     }
     return ret;
 }
+std::string Isoform::serialize(CutoffTable const& cuts, bool rev) const {
+    auto scores = get_scores();
+    std::vector<std::reference_wrapper<Feature const>> included;
 
-void mainsub_dists_only(Annotation const& anno, SAMLoader& alig,
-        std::string const& ddir) {
-    // table for storing distribution info
-    std::unordered_map<std::string, std::vector<double>> dist_table;
     for (Feature const& f : anno) {
-        dist_table[f.name] = std::vector<double>();
-    }
-    SAMRecord rec;
-    while (rec = alig.next(), alig) {
-        std::unordered_map<std::string, double> scores =
-            Isoform(anno, rec).get_scores();
-        for (auto const& p : scores) {
-            dist_table[p.first].push_back(p.second);
+        double s = scores[f.name];
+        Cutoff const& cut = cuts.at(f.name);
+        if (s >= cut.inclusion) {
+            included.emplace_back(f);
+        }
+        else if (s > cut.exclusion) {
+            // it doesn't fit in either category; throw us out!
+            return "(undecidable)";
         }
     }
 
-    mkdir(ddir.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
-    // (fails if dir already exists)
-    
-    for (auto& p : dist_table) {
-        std::string fpath = ddir + "/" + p.first + ".tsv";
-        std::ofstream fout(fpath);
-        if (!fout) {
-            throw MyErr("failed to open distribution output file: ", fpath);
-        }
-        std::sort(p.second.begin(), p.second.end());
-        for (double d : p.second) {
-            fout << d << std::endl;
-        }
-        fout.close();
+    // sort by feature position
+    auto sense_sorter = [](
+            std::reference_wrapper<Feature const> a,
+            std::reference_wrapper<Feature const> b) {
+        return a < b;
+    };
+    auto antisense_sorter = [](
+            std::reference_wrapper<Feature const> a,
+            std::reference_wrapper<Feature const> b) {
+        return b < a;
+    };
+    std::sort(included.begin(), included.end(),
+            rev ? antisense_sorter : sense_sorter);
+
+    // combine into string
+    std::string ret;
+    for (std::reference_wrapper<Feature const> const& f : included) {
+        ret += f.get().name;
+        ret += ",";
     }
+    if (!ret.empty()) {
+        // remove trailing comma
+        ret = ret.substr(0, ret.size()-1);
+    }
+    else {
+        ret = "(empty)";
+    }
+    return ret;
 }
 
 int main(int argc, char **argv) {
     try {
         Config cfg(argc, argv);
 
-        if (cfg.dist_dir.empty()) {
-            throw MyErr("sorry -- isoform serialization is not yet supported.");
-        }
         Annotation anno(cfg.anno_path);
         SAMLoader alig(cfg.alig_path);
-        mainsub_dists_only(anno, alig, cfg.dist_dir);
+
+        bool do_serialize = !cfg.defcut_spec.empty();
+        bool do_dists = !cfg.dist_dir.empty();
+        if (!do_serialize && !do_dists) {
+            throw MyErr("nothing to do! Use -h for usage info.");
+        }
+
+        std::unordered_map<std::string, std::vector<double>> dist_table;
+        for (Feature const& f : anno) {
+            dist_table[f.name] = std::vector<double>();
+        }
+        std::unordered_map<std::string, uint32_t> isoform_table;
+
+        std::unique_ptr<CutoffTable> cutoffs(nullptr);
+        if (do_serialize) {
+            cutoffs.reset(
+                    new CutoffTable(anno, cfg.defcut_spec, cfg.cgrp_specs));
+        }
+
+        SAMRecord rec;
+        while (rec = alig.next(), alig) {
+            Isoform iso(anno, rec);
+
+            // add to dist table
+            if (do_dists) {
+                auto scores = iso.get_scores(); // map str --> double
+                for (auto const& p : scores) {
+                    dist_table[p.first].push_back(p.second);
+                }
+            }
+
+            // add to isoform table
+            if (do_serialize) {
+                std::string iso_name = iso.serialize(*(cutoffs.get()),
+                        cfg.antisense);
+                if (!isoform_table.count(iso_name)) {
+                    isoform_table.emplace(iso_name, 0);
+                }
+                isoform_table[iso_name]++;
+            }
+        }
+
+        // maybe output isoform table (sorted greatest to least)
+        if (do_serialize) {
+            std::vector<std::pair<std::string, uint32_t>> sorted_isos(
+                    isoform_table.begin(), isoform_table.end());
+            std::sort(sorted_isos.begin(), sorted_isos.end(),
+                    [](
+                        std::pair<std::string, uint32_t> const& a,
+                        std::pair<std::string, uint32_t> const& b)
+                    { return a.second > b.second; });
+            for (auto const& p : sorted_isos) {
+                std::cout << p.first << "\t" << p.second << "\n";
+            }
+        }
+
+        // maybe output distributions
+        if (do_dists) {
+            std::string const& ddir = cfg.dist_dir;
+            mkdir(ddir.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+            // (fails if dir already exists)
+            
+            for (auto& p : dist_table) {
+                std::string fpath = ddir + "/" + p.first + ".tsv";
+                std::ofstream fout(fpath);
+                if (!fout) {
+                    throw MyErr("failed to open distribution output file: ",
+                            fpath);
+                }
+                std::sort(p.second.begin(), p.second.end());
+                for (double d : p.second) {
+                    fout << d << std::endl;
+                }
+                fout.close();
+            }
+        }
     }
     catch (MyErr const& err) {
         std::cerr << err << std::endl;
