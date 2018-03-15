@@ -66,6 +66,7 @@ struct Config {
     std::string dist_dir; /** Directory to put distribution info in. */
 
     bool antisense; /** Serialize isoforms in antisense order. */
+    bool suppress_uninteresting; /** No (undecidable) or (empty) isoforms. */
 };
 
 /** A convenience class representing a percent value. */
@@ -267,6 +268,9 @@ Config::Config(int argc, char **argv) {
         SwitchArg antisense_arg(
                 "r", "antisense",
                 "Sort features in antisense order when serializing isoforms.");
+        SwitchArg suppress_arg(
+                "S", "suppress",
+                "Do not report (undecidable) and (empty) serialized isoforms.");
 
         cmd.add(anno_arg);
         cmd.add(alig_arg);
@@ -274,6 +278,7 @@ Config::Config(int argc, char **argv) {
         cmd.add(cutgroups_arg);
         cmd.add(distdir_arg);
         cmd.add(antisense_arg);
+        cmd.add(suppress_arg);
         cmd.parse(argc, argv);
 
         anno_path = anno_arg.getValue();
@@ -282,11 +287,7 @@ Config::Config(int argc, char **argv) {
         cgrp_specs = cutgroups_arg.getValue();
         dist_dir = distdir_arg.getValue();
         antisense = antisense_arg.getValue();
-
-        if (dist_dir.empty() == defcut_spec.empty()) {
-            // both or neither is specified
-            throw MyErr("exactly one of -d or -c must be specified!");
-        }
+        suppress_uninteresting = suppress_arg.getValue();
     }
     catch (ArgException const& err) {
         throw MyErr(err.error(), " for arg ", err.argId());
@@ -764,6 +765,11 @@ int main(int argc, char **argv) {
             if (do_serialize) {
                 std::string iso_name = iso.serialize(*(cutoffs.get()),
                         cfg.antisense);
+                if (cfg.suppress_uninteresting
+                        && (iso_name == "(undecidable)"
+                            || iso_name == "(empty)")) {
+                    continue;
+                }
                 if (!isoform_table.count(iso_name)) {
                     isoform_table.emplace(iso_name, 0);
                 }
