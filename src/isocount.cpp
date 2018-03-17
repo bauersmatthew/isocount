@@ -63,10 +63,15 @@ struct Config {
 
     std::string defcut_spec; /** Default cutoff spec. */
     std::vector<std::string> cgrp_specs; /** Cutoff group specs. */
-    std::string dist_dir; /** Directory to put distribution info in. */
 
     bool antisense; /** Serialize isoforms in antisense order. */
     bool suppress_uninteresting; /** No (undecidable) or (empty) isoforms. */
+
+    std::string dists_path; /** Directory to put distribution info in. */
+    std::string isotbl_path; /** File to put the isoform table in. */
+    std::string categ_path; /** File to put categorized read info in. */
+
+    bool verbose_dists; /** Add read name to the distribution files. */
 };
 
 /** A convenience class representing a percent value. */
@@ -125,6 +130,7 @@ public:
     /** Parse from SAM text. */
     explicit SAMRecord(std::string const& rec);
 
+    std::string name; /** Query name. */
     std::string cigar_raw; /** As given in the file. */
 
     using CigarOp = std::pair<uint32_t, char>;
@@ -193,6 +199,54 @@ protected:
     Annotation const& anno;
 };
 
+/** Helper class for generating classic isoform table output. */
+class IsoTableGen {
+private:
+    std::string out;
+    CutoffTable const *cuttbl;
+    bool rev, supp;
+
+    std::unordered_map<std::string, uint32_t> iso_table;
+
+public:
+    IsoTableGen(std::string const& out, CutoffTable const *cuts,
+            bool rev, bool suppress);
+    void add(Isoform const& iso);
+    void save();
+};
+
+/** Helper class for generating score distribution output. */
+class ScoreDistGen {
+private:
+    std::string outdir;
+    bool verbose;
+    std::unordered_map<
+        std::string,
+        std::vector<std::pair<double, std::string>>> dist_table;
+
+public:
+    ScoreDistGen(std::string const& out, Annotation const& anno,
+            bool verbose);
+    void add(Isoform const& iso, SAMRecord const& rec);
+    void save();
+};
+
+/** Helper class for generating read-specific isoform output. */
+class CategTableGen {
+private:
+    std::string out;
+    CutoffTable const *cuttbl;
+    bool rev;
+    std::vector<std::pair<std::string, std::string>> read_isos;
+    // (read id --> iso name)
+    
+public:
+    CategTableGen(std::string const& out, CutoffTable const *cuts,
+            bool rev);
+    void add(Isoform const& iso, SAMRecord const& rec);
+    void save();
+};
+
 /* IMPLEMENTATIONS */
 template<char delim='\t'>
 std::vector<std::string> split(std::string const& str) {
@@ -242,17 +296,22 @@ std::ostream& operator<<(std::ostream& os, MyErr const& err) {
     os << "E: " << err.msg;
 }
 
-std::string const Config::VERSION = "1.0.0";
+std::string const Config::VERSION = "1.1.0";
 Config::Config(int argc, char **argv) {
     using namespace TCLAP;
     try {
         CmdLine cmd(
                 "Quickly quantify the splice isoforms present in the alignment.",
                 ' ', Config::VERSION);
+        /* Inputs. */
         UnlabeledValueArg<std::string> anno_arg(
                 "annotation", "The BED6 annotation.", true, "", "anno.bed");
         UnlabeledValueArg<std::string> alig_arg(
                 "alignment", "The SAM alignment.", true, "", "alig.sam");
+        cmd.add(anno_arg);
+        cmd.add(alig_arg);
+
+        /* Serialization cutoffs. */
         ValueArg<std::string> defcut_arg(
                 "c", "cutoff", "The default cutoff. Format: inclusion,exclusion",
                 false, "", "i,e");
@@ -260,34 +319,83 @@ Config::Config(int argc, char **argv) {
                 "g", "cutoff-group",
                 "A cutoff group. Format: 'regex inclusion,exclusion'",
                 false, "pat i,e");
-        ValueArg<std::string> distdir_arg(
-                "d", "dist",
-                ("Output the distribution of mistake ratios for each feature "
-                 "the given directory."),
-                false, "", "dists/");
+        cmd.add(defcut_arg);
+        cmd.add(cutgroups_arg);
+
+        /* Isoform serialization settings. */
         SwitchArg antisense_arg(
                 "r", "antisense",
                 "Sort features in antisense order when serializing isoforms.");
         SwitchArg suppress_arg(
                 "S", "suppress",
                 "Do not report (undecidable) and (empty) serialized isoforms.");
-
-        cmd.add(anno_arg);
-        cmd.add(alig_arg);
-        cmd.add(defcut_arg);
-        cmd.add(cutgroups_arg);
-        cmd.add(distdir_arg);
         cmd.add(antisense_arg);
         cmd.add(suppress_arg);
+
+        /* Distribution output settings. */
+        SwitchArg verbosedists_arg(
+                "D", "verbose-dists",
+                ("Include the source read ID in a second column for each row "
+                 "in the score distribution tables."));
+        cmd.add(verbosedists_arg);
+
+        ValueArg<std::string> distdir_arg(
+                "d", "dist",
+                ("Output the distribution of mistake ratios for each feature "
+                 "the given directory."),
+                false, "", "dists/");
+        ValueArg<std::string> isotbl_arg(
+                "o", "table-out",
+                ("Output the isoform table to the given file. If not given, "
+                 "but --cutoff is given, then /dev/stdout is used."),
+                false, "", "isos.tsv");
+        ValueArg<std::string> categ_arg(
+                "C", "categorize",
+                ("Categorize (serialize) each read, and output a table "
+                 "linking read IDs to isoform serializations to the given "
+                 "file."),
+                false, "", "read-isos.tsv");
+        cmd.add(distdir_arg);
+        cmd.add(isotbl_arg);
+        cmd.add(categ_arg);
+
+        /* Parse and store. */
         cmd.parse(argc, argv);
 
         anno_path = anno_arg.getValue();
         alig_path = alig_arg.getValue();
+
         defcut_spec = defcut_arg.getValue();
         cgrp_specs = cutgroups_arg.getValue();
-        dist_dir = distdir_arg.getValue();
+
         antisense = antisense_arg.getValue();
         suppress_uninteresting = suppress_arg.getValue();
+
+        verbose_dists = verbosedists_arg.getValue();
+
+        dists_path = distdir_arg.getValue();
+        isotbl_path = isotbl_arg.getValue();
+        categ_path = categ_arg.getValue();
+
+        /* Do some error checking. */
+        if (isotbl_path.size() && defcut_spec.empty()) {
+            throw MyErr("cannot serialize isoforms without a default cutoff!");
+        }
+        if (categ_path.size() && defcut_spec.empty()) {
+            throw MyErr("cannot serialize isoforms without a default cutoff!");
+        }
+        if (defcut_spec.size() && isotbl_path.empty()) {
+            isotbl_path = "/dev/stdout";
+        }
+        if (antisense && defcut_spec.empty()) {
+            throw MyErr("-r requires serialization mode (-c)");
+        }
+        if (suppress_uninteresting && defcut_spec.empty()) {
+            throw MyErr("-S requires serialization mode (-c)");
+        }
+        if (verbose_dists && dists_path.empty()) {
+            throw MyErr("-D requires -d");
+        }
     }
     catch (ArgException const& err) {
         throw MyErr(err.error(), " for arg ", err.argId());
@@ -408,6 +516,8 @@ SAMRecord::SAMRecord(std::string const& rec) {
         throw MyErr("incomplete SAM record");
     }
     try {
+        name = fields[0];
+
         int flag = ss_conv_s<int>(fields[1]);
         if (flag & 0x4 || flag & 0x900) { // ==> unmapped or not primary
             good = false;
@@ -724,6 +834,112 @@ std::string Isoform::serialize(CutoffTable const& cuts, bool rev) const {
     return ret;
 }
 
+IsoTableGen::IsoTableGen(std::string const& o, CutoffTable const *c,
+        bool r, bool s) : out(o), cuttbl(c), rev(r), supp(s) {}
+void IsoTableGen::add(Isoform const& iso) {
+    if (out.empty()) {
+        return;
+    }
+    std::string ser = iso.serialize(*cuttbl, rev);
+    if (!supp || (ser != "(undecidable)" && ser != "(empty)")) {
+        if (!iso_table.count(ser)) {
+            iso_table.emplace(ser, 0);
+        }
+        iso_table[ser]++;
+    }
+}
+void IsoTableGen::save() {
+    if (out.empty()) {
+        return;
+    }
+    std::ofstream fout(out);
+    if (!fout) {
+        throw MyErr("failed to open output file: ", out);
+    }
+    std::vector<std::pair<std::string, uint32_t>> sorted(
+            iso_table.begin(), iso_table.end());
+    std::sort(sorted.begin(), sorted.end(),
+            [](
+                std::pair<std::string, double> const& a,
+                std::pair<std::string, double> const& b)
+            { return a.second > b.second; });
+    for (auto const& p : sorted) {
+        fout << p.first << '\t' << p.second << std::endl;
+    }
+    fout.close();
+}
+
+ScoreDistGen::ScoreDistGen(std::string const& o, Annotation const& a,
+        bool v) : outdir(o), verbose(v) {
+    if (outdir.empty()) {
+        return;
+    }
+    for (Feature const& f : a) {
+        dist_table.emplace(f.name,
+                std::vector<std::pair<double, std::string>>());
+    }
+}
+void ScoreDistGen::add(Isoform const& iso, SAMRecord const& rec) {
+    if (outdir.empty()) {
+        return;
+    }
+    auto scores = iso.get_scores();
+    for (auto const& p : scores) {
+        dist_table[p.first].emplace_back(p.second, rec.name);
+    }
+}
+void ScoreDistGen::save() {
+    if (outdir.empty()) {
+        return;
+    }
+    mkdir(outdir.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+    // (fails if dir already exists)
+    
+    for (auto& p : dist_table) {
+        std::string fpath = outdir + "/" + p.first + ".tsv";
+        std::ofstream fout(fpath);
+        if (!fout) {
+            throw MyErr("failed to open distribution output file: ", fpath);
+        }
+        std::sort(p.second.begin(), p.second.end(),
+                [](
+                    std::pair<double, std::string> const& a,
+                    std::pair<double, std::string> const& b)
+                { return a.first < b.first; });
+        for (auto const& p2 : p.second) {
+            fout << p2.first;
+            if (verbose) {
+                fout << '\t' << p2.second;
+            }
+            fout << std::endl;
+        }
+        fout.close();
+    }
+}
+
+CategTableGen::CategTableGen(std::string const& o, CutoffTable const *c,
+        bool r) : out(o), cuttbl(c), rev(r) {}
+void CategTableGen::add(Isoform const& iso, SAMRecord const& rec) {
+    if (out.empty()) {
+        return;
+    }
+    std::string ser = iso.serialize(*cuttbl, rev);
+    read_isos.emplace_back(rec.name, ser);
+}
+void CategTableGen::save() {
+    if (out.empty()) {
+        return;
+    }
+    std::ofstream fout(out);
+    if (!fout) {
+        throw MyErr("failed to open output file: ", out);
+    }
+    for (auto const& p : read_isos) {
+        fout << p.first << '\t' << p.second << std::endl;
+    }
+    fout.close();
+}
+
 int main(int argc, char **argv) {
     try {
         Config cfg(argc, argv);
@@ -731,86 +947,29 @@ int main(int argc, char **argv) {
         Annotation anno(cfg.anno_path);
         SAMLoader alig(cfg.alig_path);
 
-        bool do_serialize = !cfg.defcut_spec.empty();
-        bool do_dists = !cfg.dist_dir.empty();
-        if (!do_serialize && !do_dists) {
-            throw MyErr("nothing to do! Use -h for usage info.");
-        }
-
-        std::unordered_map<std::string, std::vector<double>> dist_table;
-        for (Feature const& f : anno) {
-            dist_table[f.name] = std::vector<double>();
-        }
-        std::unordered_map<std::string, uint32_t> isoform_table;
-
         std::unique_ptr<CutoffTable> cutoffs(nullptr);
-        if (do_serialize) {
-            cutoffs.reset(
-                    new CutoffTable(anno, cfg.defcut_spec, cfg.cgrp_specs));
+        if (!cfg.defcut_spec.empty()) {
+            cutoffs.reset(new CutoffTable(anno, cfg.defcut_spec,
+                        cfg.cgrp_specs));
         }
+
+        IsoTableGen g_isotbl(cfg.isotbl_path, cutoffs.get(),
+            cfg.antisense, cfg.suppress_uninteresting);
+        ScoreDistGen g_dists(cfg.dists_path, anno, cfg.verbose_dists);
+        CategTableGen g_categ(cfg.categ_path, cutoffs.get(), cfg.antisense);
 
         SAMRecord rec;
         while (rec = alig.next(), alig) {
             Isoform iso(anno, rec);
 
-            // add to dist table
-            if (do_dists) {
-                auto scores = iso.get_scores(); // map str --> double
-                for (auto const& p : scores) {
-                    dist_table[p.first].push_back(p.second);
-                }
-            }
-
-            // add to isoform table
-            if (do_serialize) {
-                std::string iso_name = iso.serialize(*(cutoffs.get()),
-                        cfg.antisense);
-                if (cfg.suppress_uninteresting
-                        && (iso_name == "(undecidable)"
-                            || iso_name == "(empty)")) {
-                    continue;
-                }
-                if (!isoform_table.count(iso_name)) {
-                    isoform_table.emplace(iso_name, 0);
-                }
-                isoform_table[iso_name]++;
-            }
+            g_isotbl.add(iso);
+            g_dists.add(iso, rec);
+            g_categ.add(iso, rec);
         }
 
-        // maybe output isoform table (sorted greatest to least)
-        if (do_serialize) {
-            std::vector<std::pair<std::string, uint32_t>> sorted_isos(
-                    isoform_table.begin(), isoform_table.end());
-            std::sort(sorted_isos.begin(), sorted_isos.end(),
-                    [](
-                        std::pair<std::string, uint32_t> const& a,
-                        std::pair<std::string, uint32_t> const& b)
-                    { return a.second > b.second; });
-            for (auto const& p : sorted_isos) {
-                std::cout << p.first << "\t" << p.second << "\n";
-            }
-        }
-
-        // maybe output distributions
-        if (do_dists) {
-            std::string const& ddir = cfg.dist_dir;
-            mkdir(ddir.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
-            // (fails if dir already exists)
-            
-            for (auto& p : dist_table) {
-                std::string fpath = ddir + "/" + p.first + ".tsv";
-                std::ofstream fout(fpath);
-                if (!fout) {
-                    throw MyErr("failed to open distribution output file: ",
-                            fpath);
-                }
-                std::sort(p.second.begin(), p.second.end());
-                for (double d : p.second) {
-                    fout << d << std::endl;
-                }
-                fout.close();
-            }
-        }
+        g_isotbl.save();
+        g_dists.save();
+        g_categ.save();
     }
     catch (MyErr const& err) {
         std::cerr << err << std::endl;
